@@ -146,55 +146,103 @@ footer {
 var PLATFORMS = ['Facebook', 'TikTok', 'Instagram', 'Pinterest', 'Threads', 'YouTube'];
 var STATUS_ORDER = ['held', 'scheduled', 'posted'];
 var STATUS_LABEL = { held: 'Held', scheduled: 'Scheduled', posted: 'Posted' };
-var STORE_KEY = 'social-command-center-queue-v1';
-var OVERRIDE_KEY = 'social-command-center-overrides-v1';
 
-// Agent-added items are baked in here (committed to this file). Her phone keeps
-// only per-device status overrides, so baked items show on every device and her
-// taps still win locally. ids are stable: baked-YYYYMMDD-short-slug.
-var BAKED_ITEMS = [
-  // { id: 'baked-20260923-suno-reaction', platform: 'TikTok', name: 'Suno v6 reaction short', time: 'Wed 6pm', status: 'scheduled' }
-];
+var SUPA_URL = 'https://gfdmqdlosmvyftcfncbl.supabase.co';
+var SUPA_KEY = 'sb_publishable_66yxelTBWPJpuDzqhWsaOQ_OZKLK2ny';
+var OLD_QUEUE_KEY = 'social-command-center-queue-v1';
+var OLD_OVERRIDE_KEY = 'social-command-center-overrides-v1';
+var CACHE_KEY = 'scc-cache-v2';
+var PENDING_KEY = 'scc-pending-v2';
+var MIGRATED_KEY = 'scc-migrated-v2';
 
-function loadOverrides() {
-  try {
-    var raw = localStorage.getItem(OVERRIDE_KEY);
-    if (raw) { var p = JSON.parse(raw); if (p && typeof p === 'object') return p; }
-  } catch (e) {}
-  return {};
-}
-function saveOverrides(o) {
-  try { localStorage.setItem(OVERRIDE_KEY, JSON.stringify(o)); } catch (e) {}
-}
-var overrides = loadOverrides();
+var items = [];          // flat list, single source of truth is the database
+var syncState = 'loading';
 
-// Baked items for a platform, with any local status override applied, then her
-// phone-local items. Merge is by stable id, so no duplicates and no clobbering.
-function itemsFor(platform) {
-  var local = queues[platform] || [];
-  var merged = [];
-  for (var i = 0; i < BAKED_ITEMS.length; i++) {
-    var b = BAKED_ITEMS[i];
-    if (b.platform !== platform) continue;
-    var st = overrides[b.id] !== undefined ? overrides[b.id] : b.status;
-    if (st === 'hidden') continue;
-    merged.push({ id: b.id, name: b.name, time: b.time, status: st, baked: true });
-  }
-  for (var j = 0; j < local.length; j++) merged.push(local[j]);
-  return merged;
+function lsGet(k) { try { var r = localStorage.getItem(k); return r ? JSON.parse(r) : null; } catch (e) { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+
+function api(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({
+    apikey: SUPA_KEY,
+    Authorization: 'Bearer ' + SUPA_KEY,
+    'Content-Type': 'application/json'
+  }, opts.headers || {});
+  return fetch(SUPA_URL + '/rest/v1/' + path, opts).then(function (res) {
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return res;
+  });
 }
 
-function loadQueues() {
-  try {
-    var raw = localStorage.getItem(STORE_KEY);
-    if (raw) { var p = JSON.parse(raw); if (p && typeof p === 'object') return p; }
-  } catch (e) {}
-  return {};
+function fetchItems() {
+  return api('queue_items?select=id,platform,name,time,status&order=created_at.asc')
+    .then(function (res) { return res.json(); });
 }
-function saveQueues(q) {
-  try { localStorage.setItem(STORE_KEY, JSON.stringify(q)); } catch (e) {}
+
+function queuePending(op) {
+  var p = lsGet(PENDING_KEY) || [];
+  p.push(op);
+  lsSet(PENDING_KEY, p);
 }
-var queues = loadQueues();
+function flushPending() {
+  var p = lsGet(PENDING_KEY) || [];
+  if (!p.length) return Promise.resolve();
+  var chain = Promise.resolve();
+  p.forEach(function (op) {
+    chain = chain.then(function () {
+      return op.op === 'delete'
+        ? api('queue_items?id=eq.' + encodeURIComponent(op.id), { method: 'DELETE' })
+        : api('queue_items', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(op.row) });
+    });
+  });
+  return chain.then(function () { lsSet(PENDING_KEY, []); })
+    .catch(function () { /* keep pending for next retry */ throw new Error('flush failed'); });
+}
+
+function mirrorCache() { lsSet(CACHE_KEY, items); }
+
+// One-time move of this device's v1 phone-local items into the database.
+// Non-destructive: the old localStorage keys are left untouched.
+function migrateLegacy() {
+  if (lsGet(MIGRATED_KEY)) return;
+  var old = lsGet(OLD_QUEUE_KEY) || {};
+  var rows = [];
+  Object.keys(old).forEach(function (platform) {
+    (old[platform] || []).forEach(function (it) {
+      if (it && it.id && it.name) {
+        rows.push({ id: String(it.id), platform: platform, name: String(it.name), time: String(it.time || ''), status: STATUS_ORDER.indexOf(it.status) >= 0 ? it.status : 'held', updated_at: new Date().toISOString() });
+      }
+    });
+  });
+  var done = function () { lsSet(MIGRATED_KEY, true); };
+  if (!rows.length) { done(); return; }
+  api('queue_items', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(rows) })
+    .then(done)
+    .catch(function () { rows.forEach(function (r) { queuePending({ op: 'upsert', row: r }); }); done(); });
+}
+
+function refresh() {
+  return fetchItems().then(function (rows) {
+    items = rows;
+    syncState = 'live';
+    mirrorCache();
+    render();
+  }).catch(function () {
+    syncState = 'offline';
+    render();
+  });
+}
+
+function writeRow(row) {
+  api('queue_items', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(row) })
+    .then(function () { syncState = 'live'; render(); })
+    .catch(function () { syncState = 'offline'; queuePending({ op: 'upsert', row: row }); render(); });
+}
+function deleteRow(id) {
+  api('queue_items?id=eq.' + encodeURIComponent(id), { method: 'DELETE' })
+    .then(function () { syncState = 'live'; render(); })
+    .catch(function () { syncState = 'offline'; queuePending({ op: 'delete', id: id }); render(); });
+}
 
 function nextStatus(s) { return STATUS_ORDER[(STATUS_ORDER.indexOf(s) + 1) % STATUS_ORDER.length]; }
 
@@ -202,20 +250,31 @@ function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+function itemsFor(platform) {
+  return items.filter(function (it) { return it.platform === platform; });
+}
+
+function syncNote() {
+  if (syncState === 'live') return '<p class="counts">Synced across your devices.</p>';
+  if (syncState === 'offline') return '<p class="counts">Connection lost - your changes are saved on this device and will sync when you are back online.</p>';
+  return '<p class="counts">Loading your queue...</p>';
+}
+
 function renderQueue() {
   var html = '<p class="intro">Your holding area for everything you make. Tap a status pill to move a piece from held to scheduled to posted, and tap again to cycle back. Add the planned post time so you know what goes out when.</p>';
+  html += syncNote();
   for (var i = 0; i < PLATFORMS.length; i++) {
     var p = PLATFORMS[i];
-    var items = itemsFor(p);
+    var list = itemsFor(p);
     var c = { held: 0, scheduled: 0, posted: 0 };
-    for (var j = 0; j < items.length; j++) c[items[j].status]++;
+    for (var j = 0; j < list.length; j++) c[list[j].status]++;
     html += '<h2>' + p + '</h2>';
     html += '<p class="counts">' + c.held + ' held &middot; ' + c.scheduled + ' scheduled &middot; ' + c.posted + ' posted</p>';
-    if (items.length === 0) {
+    if (list.length === 0) {
       html += '<p class="empty">Nothing here yet. Add your first piece below.</p>';
     } else {
-      for (var k = 0; k < items.length; k++) {
-        var it = items[k];
+      for (var k = 0; k < list.length; k++) {
+        var it = list[k];
         html += '<div class="item" data-status="' + it.status + '">' +
           '<button type="button" class="pill" data-status="' + it.status + '" data-act="cycle" data-platform="' + p + '" data-id="' + it.id + '" aria-label="Status: ' + STATUS_LABEL[it.status] + '. Tap to advance.">' + STATUS_LABEL[it.status] + '</button>' +
           '<div class="item-main"><div class="item-name">' + esc(it.name) + '</div>' +
@@ -294,6 +353,7 @@ function renderHot() {
   return html;
 }
 
+
 function render() {
   var hash = location.hash === '#hot' ? '#hot' : '#queue';
   document.getElementById('tab-queue').className = hash === '#queue' ? 'active' : '';
@@ -305,7 +365,7 @@ function render() {
     foot.textContent = 'Trends scanned 22 Sep 2026. The Instinct file mirror refreshes each morning.';
   } else {
     view.innerHTML = renderQueue();
-    foot.textContent = 'Check-offs and new items save on this device. Anything VANTA adds for you shows up on every device.';
+    foot.textContent = 'Your queue lives in one shared list now - add or check off on any device and every device sees it. Anything VANTA adds for you lands here too.';
   }
 }
 
@@ -317,39 +377,49 @@ document.getElementById('view').addEventListener('click', function (e) {
   if (act === 'cycle' || act === 'remove') {
     var tid = btn.getAttribute('data-id');
     var current = null;
-    var all = itemsFor(platform);
-    for (var m = 0; m < all.length; m++) if (all[m].id === tid) current = all[m];
+    for (var m = 0; m < items.length; m++) if (items[m].id === tid) current = items[m];
     if (!current) return;
-    if (current.baked) {
-      overrides[tid] = act === 'cycle' ? nextStatus(current.status) : 'hidden';
-      saveOverrides(overrides);
-    } else if (act === 'cycle') {
-      var li = queues[platform] || [];
-      for (var n = 0; n < li.length; n++) if (li[n].id === tid) li[n].status = nextStatus(li[n].status);
-      saveQueues(queues);
+    if (act === 'cycle') {
+      current.status = nextStatus(current.status);
+      current.updated_at = new Date().toISOString();
+      mirrorCache();
+      render();
+      writeRow({ id: current.id, platform: current.platform, name: current.name, time: current.time || '', status: current.status, updated_at: current.updated_at });
     } else {
-      queues[platform] = (queues[platform] || []).filter(function (it) { return it.id !== tid; });
-      saveQueues(queues);
+      items = items.filter(function (it) { return it.id !== tid; });
+      mirrorCache();
+      render();
+      deleteRow(tid);
     }
-    render();
     return;
   }
-  var items = queues[platform] || [];
   if (act === 'add') {
     var idx = btn.getAttribute('data-idx');
     var nameEl = document.getElementById('name-' + idx);
     var timeEl = document.getElementById('time-' + idx);
     var name = nameEl.value.trim();
     if (!name) return;
-    items.push({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8), name: name, time: timeEl.value.trim(), status: 'held' });
-    queues[platform] = items;
+    var row = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8), platform: platform, name: name, time: timeEl.value.trim(), status: 'held', updated_at: new Date().toISOString() };
+    items.push(row);
+    mirrorCache();
+    render();
+    writeRow(row);
   }
-  saveQueues(queues);
-  render();
 });
 
 window.addEventListener('hashchange', render);
-render();
+document.addEventListener('visibilitychange', function () { if (!document.hidden) { flushPending().finally(refresh); } });
+window.addEventListener('focus', function () { flushPending().finally(refresh); });
+
+// Boot: show cached state instantly, run the one-time v1 migration, then sync.
+(function boot() {
+  var cached = lsGet(CACHE_KEY);
+  if (cached && cached.length) items = cached;
+  syncState = cached && cached.length ? 'offline' : 'loading';
+  render();
+  migrateLegacy();
+  flushPending().finally(refresh);
+})();
 </script>
 </body>
 </html>
