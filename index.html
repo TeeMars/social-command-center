@@ -147,6 +147,42 @@ var PLATFORMS = ['Facebook', 'TikTok', 'Instagram', 'Pinterest', 'Threads', 'You
 var STATUS_ORDER = ['held', 'scheduled', 'posted'];
 var STATUS_LABEL = { held: 'Held', scheduled: 'Scheduled', posted: 'Posted' };
 var STORE_KEY = 'social-command-center-queue-v1';
+var OVERRIDE_KEY = 'social-command-center-overrides-v1';
+
+// Agent-added items are baked in here (committed to this file). Her phone keeps
+// only per-device status overrides, so baked items show on every device and her
+// taps still win locally. ids are stable: baked-YYYYMMDD-short-slug.
+var BAKED_ITEMS = [
+  { id: 'baked-20260922-test-wiring', platform: 'Instagram', name: 'Wiring test - safe to ignore', time: 'never', status: 'held' }
+];
+
+function loadOverrides() {
+  try {
+    var raw = localStorage.getItem(OVERRIDE_KEY);
+    if (raw) { var p = JSON.parse(raw); if (p && typeof p === 'object') return p; }
+  } catch (e) {}
+  return {};
+}
+function saveOverrides(o) {
+  try { localStorage.setItem(OVERRIDE_KEY, JSON.stringify(o)); } catch (e) {}
+}
+var overrides = loadOverrides();
+
+// Baked items for a platform, with any local status override applied, then her
+// phone-local items. Merge is by stable id, so no duplicates and no clobbering.
+function itemsFor(platform) {
+  var local = queues[platform] || [];
+  var merged = [];
+  for (var i = 0; i < BAKED_ITEMS.length; i++) {
+    var b = BAKED_ITEMS[i];
+    if (b.platform !== platform) continue;
+    var st = overrides[b.id] !== undefined ? overrides[b.id] : b.status;
+    if (st === 'hidden') continue;
+    merged.push({ id: b.id, name: b.name, time: b.time, status: st, baked: true });
+  }
+  for (var j = 0; j < local.length; j++) merged.push(local[j]);
+  return merged;
+}
 
 function loadQueues() {
   try {
@@ -170,7 +206,7 @@ function renderQueue() {
   var html = '<p class="intro">Your holding area for everything you make. Tap a status pill to move a piece from held to scheduled to posted, and tap again to cycle back. Add the planned post time so you know what goes out when.</p>';
   for (var i = 0; i < PLATFORMS.length; i++) {
     var p = PLATFORMS[i];
-    var items = queues[p] || [];
+    var items = itemsFor(p);
     var c = { held: 0, scheduled: 0, posted: 0 };
     for (var j = 0; j < items.length; j++) c[items[j].status]++;
     html += '<h2>' + p + '</h2>';
@@ -269,7 +305,7 @@ function render() {
     foot.textContent = 'Trends scanned 22 Sep 2026. The Instinct file mirror refreshes each morning.';
   } else {
     view.innerHTML = renderQueue();
-    foot.textContent = 'Check-offs and new items save in this browser automatically.';
+    foot.textContent = 'Check-offs and new items save on this device. Anything VANTA adds for you shows up on every device.';
   }
 }
 
@@ -278,6 +314,26 @@ document.getElementById('view').addEventListener('click', function (e) {
   if (!btn) return;
   var platform = btn.getAttribute('data-platform');
   var act = btn.getAttribute('data-act');
+  if (act === 'cycle' || act === 'remove') {
+    var tid = btn.getAttribute('data-id');
+    var current = null;
+    var all = itemsFor(platform);
+    for (var m = 0; m < all.length; m++) if (all[m].id === tid) current = all[m];
+    if (!current) return;
+    if (current.baked) {
+      overrides[tid] = act === 'cycle' ? nextStatus(current.status) : 'hidden';
+      saveOverrides(overrides);
+    } else if (act === 'cycle') {
+      var li = queues[platform] || [];
+      for (var n = 0; n < li.length; n++) if (li[n].id === tid) li[n].status = nextStatus(li[n].status);
+      saveQueues(queues);
+    } else {
+      queues[platform] = (queues[platform] || []).filter(function (it) { return it.id !== tid; });
+      saveQueues(queues);
+    }
+    render();
+    return;
+  }
   var items = queues[platform] || [];
   if (act === 'add') {
     var idx = btn.getAttribute('data-idx');
@@ -287,12 +343,6 @@ document.getElementById('view').addEventListener('click', function (e) {
     if (!name) return;
     items.push({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8), name: name, time: timeEl.value.trim(), status: 'held' });
     queues[platform] = items;
-  } else if (act === 'cycle') {
-    var id = btn.getAttribute('data-id');
-    for (var i = 0; i < items.length; i++) if (items[i].id === id) items[i].status = nextStatus(items[i].status);
-  } else if (act === 'remove') {
-    var rid = btn.getAttribute('data-id');
-    queues[platform] = items.filter(function (it) { return it.id !== rid; });
   }
   saveQueues(queues);
   render();
